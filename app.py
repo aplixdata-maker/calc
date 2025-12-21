@@ -7,7 +7,7 @@ from io import BytesIO
 st.set_page_config(
     page_title="Meesho Profit/loss calculator",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"  # Changed to collapsed for mobile friendliness
 )
 
 # --- SECURITY: Password Authentication ---
@@ -81,7 +81,7 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
 
     except Exception as e:
         st.error(f"Error reading one or more files: {e}")
-        return None, None
+        return None, None, None
 
     # --- Data Processing ---
     df_same.columns = excel_cols
@@ -124,15 +124,31 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
     cost_lookup.columns = ['SKU_Lookup', 'Cost_Value'] 
     df_orders_final['SKU'] = df_orders_final['SKU'].astype(str)
     cost_lookup['SKU_Lookup'] = cost_lookup['SKU_Lookup'].astype(str)
+    
+    # Merge with Cost Lookup
     df_orders_final = pd.merge(df_orders_final, cost_lookup, left_on='SKU', right_on='SKU_Lookup', how='left')
+
+    # ----------------------------------------------------
+    # IDENTIFY MISSING SKUS & PREPARE DETAILS
+    # ----------------------------------------------------
+    # Identify rows where Cost_Value is NaN (meaning SKU wasn't in cost sheet)
+    missing_cost_mask = df_orders_final['Cost_Value'].isna()
+    
+    # Create the Detail Dataframe for the Dashboard
+    missing_details_df = df_orders_final.loc[missing_cost_mask, ['Sub Order No', 'SKU', 'status', 'Quantity', 'total']].copy()
+    missing_details_df.rename(columns={'total': 'Total Payment'}, inplace=True)
+    
+    # Fill NaN with 0 temporarily for Calculation
+    df_orders_final['Cost_Value'] = df_orders_final['Cost_Value'].fillna(0)
 
     # 1. Product Cost Calculation (Only for Delivered and Exchange)
     condition_product = df_orders_final['status'].str.strip().isin(['Delivered', 'Exchange'])
+    
+    # Calculate numeric cost
     df_orders_final['cost'] = np.where(condition_product, df_orders_final['Cost_Value'], 0)
-    df_orders_final['cost'] = df_orders_final['cost'].fillna(0)
     df_orders_final['actual cost'] = df_orders_final['cost'] * df_orders_final['Quantity']
 
-    # 2. Packaging Cost Calculation (UPDATED: Delivered, Exchange & Return only)
+    # 2. Packaging Cost Calculation
     condition_packaging = df_orders_final['status'].str.strip().isin(['Delivered', 'Exchange', 'Return'])
     df_orders_final['packaging cost'] = np.where(condition_packaging, packaging_cost_value, 0)
     
@@ -164,6 +180,16 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
         "count_ready_to_ship": len(df_orders_final[status_series == 'Ready_to_ship'])
     }
 
+    # ----------------------------------------------------
+    # EXPORT PREP: Replace 0 with "SKU Not Found"
+    # ----------------------------------------------------
+    df_orders_final['cost'] = df_orders_final['cost'].astype(object)
+    df_orders_final['actual cost'] = df_orders_final['actual cost'].astype(object)
+    
+    condition_display_error = missing_cost_mask & condition_product
+    df_orders_final.loc[condition_display_error, 'cost'] = "SKU Not Found"
+    df_orders_final.loc[condition_display_error, 'actual cost'] = "SKU Not Found"
+
     # --- Write to Excel ---
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
@@ -176,7 +202,8 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
         # ---------------------------------------------------------------------
         pkg_filter = df_orders_final['status'].str.strip().isin(['Delivered', 'Return', 'Exchange'])
         df_pkg = df_orders_final[pkg_filter][['Sub Order No', 'SKU', 'status', 'actual cost']].copy()
-        pkg_sum = df_pkg['actual cost'].sum()
+        
+        pkg_sum = pd.to_numeric(df_pkg['actual cost'], errors='coerce').sum()
         
         total_row_data = {
             'Sub Order No': '',
@@ -193,7 +220,7 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
         df_next_sheet.to_excel(writer, sheet_name='next month', index=False)
 
     output.seek(0)
-    return output, stats
+    return output, stats, missing_details_df
 
 # --- Streamlit App Interface (GATED) ---
 if check_password():
@@ -218,9 +245,10 @@ if check_password():
     if orders_file and same_month_file and next_month_file and cost_file:
         if st.button("🚀 Process Data and Generate Report", type="primary"):
             with st.spinner("Processing data..."):
-                excel_data, stats = process_data(orders_file, same_month_file, next_month_file, cost_file, pack_cost, misc_cost)
+                excel_data, stats, missing_details = process_data(orders_file, same_month_file, next_month_file, cost_file, pack_cost, misc_cost)
                 
                 if excel_data and stats:
+                    
                     with results_container:
                         st.success("✅ Processing Complete!")
                         
@@ -234,6 +262,22 @@ if check_password():
                         col3.metric("Packaging", f"₹{stats['Total Packaging Cost']:,.2f}")
                         col4.metric("Ads (Same Month)", f"₹{stats['Same Month Ads Cost']:,.2f}")
                         
+                        # --- NEW SECTION: Missing SKU Details Table (Main Dashboard) ---
+                        if not missing_details.empty:
+                            st.markdown("---")
+                            st.error(f"⚠️ **{len(missing_details)} Orders Missing SKU Cost**")
+                            st.caption("The following orders have SKUs that were not found in your cost sheet. They are calculated as 0 cost.")
+                            
+                            # Display the detailed dataframe in an expander or directly
+                            st.dataframe(
+                                missing_details, 
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Total Payment": st.column_config.NumberColumn(format="₹%.2f")
+                                }
+                            )
+
                         st.divider()
 
                         st.markdown("### 📦 Order Status Breakdown")
