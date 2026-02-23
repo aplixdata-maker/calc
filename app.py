@@ -187,9 +187,12 @@ if check_password():
 
     if orders_file and cost_file and same_month_file and next_month_file:
         if st.button("Calculate", type="primary"):
-            excel_data, stats, missing = process_data(orders_file, same_month_file, next_month_file, cost_file, pack_cost, misc_cost)
+            # --- Show processing icon ---
+            with st.spinner('Crunching numbers... Please wait.'):
+                excel_data, stats, missing = process_data(orders_file, same_month_file, next_month_file, cost_file, pack_cost, misc_cost)
             
             if stats:
+                st.success("Analysis Complete!")
                 st.metric("Total Profit/Loss", f"₹{stats['Profit / Loss']:,.2f}")
                 
                 cols = st.columns(4)
