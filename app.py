@@ -45,13 +45,11 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
         # --- B. Read Order Payments (Dynamic Column Mapping) ---
         def read_payment_sheet(file):
             df_raw = pd.read_excel(file, sheet_name='Order Payments', header=1)
-            # Find columns dynamically to avoid hardcoded letter errors
             cols_to_extract = {
                 "Sub Order No": "Sub Order No",
                 "Live Order Status": "Live Order Status",
                 "Final Settlement Amount": "Final Settlement Amount"
             }
-            # Verify columns exist
             for key, val in cols_to_extract.items():
                 if val not in df_raw.columns:
                     raise ValueError(f"Column '{val}' not found in sheet 'Order Payments'")
@@ -67,12 +65,11 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
         else:
             df_cost = pd.read_excel(cost_file)
 
-        # --- D. Read Ads Cost (Dynamic Column Mapping) ---
+        # --- D. Read Ads Cost ---
         def get_ads_sum(file):
             file.seek(0)
             try:
                 df_ads = pd.read_excel(file, sheet_name='Ads Cost', header=1)
-                # Find column that contains "Total Ads Cost"
                 ads_col = [c for c in df_ads.columns if 'Total Ads Cost' in str(c)][0]
                 return pd.to_numeric(df_ads[ads_col], errors='coerce').sum()
             except:
@@ -89,10 +86,8 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
     df_orders_raw = df_orders[["Sub Order No", "SKU", "Quantity"]].copy()
     df_orders_raw['Quantity'] = pd.to_numeric(df_orders_raw['Quantity'], errors='coerce').fillna(0)
 
-    # Combine payment statuses
     df_order_status_pool = pd.concat([df_same, df_next], ignore_index=True)
     
-    # Prepare Pivot Tables for Payments
     def get_pivot(df, col_name):
         df['Final Settlement Amount'] = pd.to_numeric(df['Final Settlement Amount'], errors='coerce').fillna(0)
         pivot = pd.pivot_table(df, values='Final Settlement Amount', index=['Sub Order No'], aggfunc='sum').reset_index()
@@ -105,10 +100,8 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
     # --- Merging Data ---
     df_orders_final = pd.merge(df_orders_raw, df_pivot_same, on='Sub Order No', how='left')
     df_orders_final = pd.merge(df_orders_final, df_pivot_next, on='Sub Order No', how='left')
-    
     df_orders_final['total'] = df_orders_final[['same month pay', 'next month pay']].sum(axis=1, skipna=True)
     
-    # Get Status (Last known status for the Sub Order No)
     status_lookup = df_order_status_pool[['Sub Order No', 'Live Order Status']].drop_duplicates(subset=['Sub Order No'], keep='last')
     df_orders_final = pd.merge(df_orders_final, status_lookup, on='Sub Order No', how='left')
     df_orders_final.rename(columns={'Live Order Status': 'status'}, inplace=True)
@@ -118,16 +111,12 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
     cost_lookup.columns = ['SKU_Lookup', 'Cost_Value']
     df_orders_final['SKU'] = df_orders_final['SKU'].astype(str)
     cost_lookup['SKU_Lookup'] = cost_lookup['SKU_Lookup'].astype(str)
-    
     df_orders_final = pd.merge(df_orders_final, cost_lookup, left_on='SKU', right_on='SKU_Lookup', how='left')
 
-    # Identify Missing SKUs
     missing_cost_mask = df_orders_final['Cost_Value'].isna()
     missing_details_df = df_orders_final.loc[missing_cost_mask, ['Sub Order No', 'SKU', 'status', 'Quantity', 'total']].copy()
-    
     df_orders_final['Cost_Value'] = df_orders_final['Cost_Value'].fillna(0)
 
-    # Product and Packaging Cost Logic
     clean_status = df_orders_final['status'].fillna('Unknown').str.strip()
     cond_delivered = clean_status.isin(['Delivered', 'Exchange'])
     cond_pkg = clean_status.isin(['Delivered', 'Exchange', 'Return'])
@@ -155,13 +144,11 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
         "count_ready_to_ship": len(df_orders_final[clean_status == 'Ready_to_ship'])
     }
 
-    # --- Export Prep ---
     output = BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df_orders_final.drop(columns=['SKU_Lookup', 'Cost_Value'], errors='ignore').to_excel(writer, sheet_name='orders', index=False)
         pd.DataFrame(list(stats.items()), columns=['Metric', 'Value']).to_excel(writer, sheet_name='summary', index=False)
         
-        # Cost sheet for audit
         pkg_filter = clean_status.isin(['Delivered', 'Return', 'Exchange'])
         df_pkg = df_orders_final[pkg_filter][['Sub Order No', 'SKU', 'status', 'actual cost']].copy()
         df_pkg.to_excel(writer, sheet_name='Cost Audit', index=False)
@@ -187,19 +174,34 @@ if check_password():
 
     if orders_file and cost_file and same_month_file and next_month_file:
         if st.button("Calculate", type="primary"):
-            # --- Show processing icon ---
-            with st.spinner('Crunching numbers... Please wait.'):
+            # SHOW PROCESSING ICON
+            with st.spinner('Calculating financial data...'):
                 excel_data, stats, missing = process_data(orders_file, same_month_file, next_month_file, cost_file, pack_cost, misc_cost)
             
             if stats:
-                st.success("Analysis Complete!")
-                st.metric("Total Profit/Loss", f"₹{stats['Profit / Loss']:,.2f}")
+                # --- Financial Summary ---
+                st.subheader("📈 Financial Summary")
+                st.metric("PROFIT / LOSS", f"₹{stats['Profit / Loss']:,.2f}")
                 
-                cols = st.columns(4)
-                cols[0].metric("Payments", f"₹{stats['Total Payments']:,.2f}")
-                cols[1].metric("Prod Cost", f"₹{stats['Total Actual Cost']:,.2f}")
-                cols[2].metric("Pkg Cost", f"₹{stats['Total Packaging Cost']:,.2f}")
-                cols[3].metric("Ads", f"₹{abs(stats['Same Month Ads Cost']):,.2f}")
+                f_cols = st.columns(4)
+                f_cols[0].metric("Total Payments", f"₹{stats['Total Payments']:,.2f}")
+                f_cols[1].metric("Actual Cost", f"₹{stats['Total Actual Cost']:,.2f}")
+                f_cols[2].metric("Packaging", f"₹{stats['Total Packaging Cost']:,.2f}")
+                f_cols[3].metric("Ads (Same Month)", f"₹{stats['Same Month Ads Cost']:,.2f}")
+                
+                st.divider()
+
+                # --- Order Status Breakdown ---
+                st.subheader("📦 Order Status Breakdown")
+                s_cols = st.columns(8)
+                s_cols[0].metric("Total Orders", stats['count_total'])
+                s_cols[1].metric("Delivered", stats['count_delivered'])
+                s_cols[2].metric("Return", stats['count_return'])
+                s_cols[3].metric("RTO", stats['count_rto'])
+                s_cols[4].metric("Exchange", stats['count_Exchange'])
+                s_cols[5].metric("Cancelled", stats['count_cancelled'])
+                s_cols[6].metric("Shipped", stats['count_Shipped'])
+                s_cols[7].metric("Ready_to_ship", stats['count_ready_to_ship'])
                 
                 if not missing.empty:
                     st.warning(f"Found {len(missing)} missing SKUs in cost sheet.")
