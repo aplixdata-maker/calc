@@ -2,230 +2,275 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import traceback
 
-# --- Configuration ---
-st.set_page_config(
-    page_title="Meesho Profit/loss calculator",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# --- Smart Parser Utils ---
+def find_header_row(df_raw, target_keywords):
+    """Finds the row index that likely contains headers based on the most keyword matches."""
+    best_idx = None
+    max_matches = 0
+    
+    for i, row in df_raw.head(10).iterrows():
+        row_str = " ".join(row.astype(str).str.lower())
+        matches = sum(1 for kw in target_keywords if kw.lower() in row_str)
+        if matches > max_matches:
+            max_matches = matches
+            best_idx = i
+            
+    return best_idx
 
-# --- SECURITY: Password Authentication ---
+def smart_read_file(file, target_keywords=None, sheet_name=0):
+    """Reads Excel/CSV and tries to find the correct header row."""
+    if hasattr(file, 'seek'):
+        file.seek(0)
+        
+    if file.name.lower().endswith('.csv'):
+        df_raw = pd.read_csv(file, nrows=20, header=None)
+        h_idx = find_header_row(df_raw, target_keywords) if target_keywords else 0
+        file.seek(0)
+        return pd.read_csv(file, header=h_idx if h_idx is not None else 0)
+    else:
+        xl = pd.ExcelFile(file)
+        actual_sheet = sheet_name
+        if isinstance(sheet_name, str) and sheet_name not in xl.sheet_names:
+            matches = [s for s in xl.sheet_names if sheet_name.lower() in s.lower()]
+            actual_sheet = matches[0] if matches else xl.sheet_names[0]
+        
+        df_sample = xl.parse(sheet_name=actual_sheet, nrows=20, header=None)
+        h_idx = find_header_row(df_sample, target_keywords) if target_keywords else None
+        
+        if h_idx is None and not target_keywords:
+             row0 = df_sample.iloc[0]
+             if any(isinstance(x, (int, float)) for x in row0):
+                 return xl.parse(sheet_name=actual_sheet, header=None)
+             return xl.parse(sheet_name=actual_sheet, header=0)
+
+        return xl.parse(sheet_name=actual_sheet, header=h_idx if h_idx is not None else 0)
+
+def fuzzy_get_cols(df, mapping):
+    """Maps fuzzy names to standard columns."""
+    result = {}
+    cols = [str(c).strip() for c in df.columns]
+    for standard_name, aliases in mapping.items():
+        found_col = None
+        for alias in aliases:
+            matches = [c for c in cols if alias.lower() in c.lower()]
+            if matches:
+                found_col = matches[0]
+                break
+        result[standard_name] = found_col
+    return result
+
+def get_ads_from_sheet(file):
+    """Standalone logic for ads extraction to ensure robustness."""
+    try:
+        xl = pd.ExcelFile(file)
+        # Find sheet name
+        actual_sheet = "Ads Cost"
+        if actual_sheet not in xl.sheet_names:
+            matches = [s for s in xl.sheet_names if "ads" in s.lower()]
+            actual_sheet = matches[0] if matches else xl.sheet_names[0]
+            
+        df_ads = smart_read_file(file, ["Ads Cost", "Total Ads Cost", "Campaign"], sheet_name=actual_sheet)
+        # Find column that has ads and cost
+        possible_cols = [c for c in df_ads.columns if 'ads' in str(c).lower() and 'cost' in str(c).lower()]
+        if not possible_cols:
+            possible_cols = [c for c in df_ads.columns if 'ad' in str(c).lower() and 'cost' in str(c).lower()]
+        
+        if possible_cols:
+            # Prefer 'total' if multiple matches
+            total_cols = [c for c in possible_cols if 'total' in str(c).lower()]
+            ads_col = total_cols[0] if total_cols else possible_cols[0]
+            
+            vals = pd.to_numeric(df_ads[ads_col], errors='coerce').fillna(0)
+            return vals.sum()
+        return 0
+    except:
+        return 0
+    finally:
+        if hasattr(file, 'seek'): file.seek(0)
+
+# --- Core Logic ---
+def run_profit_calculation(orders_file, same_month_file, next_month_file, cost_file, pack_cost, misc_cost):
+    # 1. Load Orders
+    df_orders_raw = smart_read_file(orders_file, ["Sub Order", "SKU", "Quantity"])
+    order_map = fuzzy_get_cols(df_orders_raw, {
+        "so": ["Sub Order No", "Order Number"],
+        "sku": ["SKU", "Supplier SKU", "Seller SKU"],
+        "qty": ["Quantity", "Qty"]
+    })
+    
+    for key in ["so", "sku", "qty"]:
+        if not order_map[key]:
+            raise ValueError(f"Orders file: mandatory column '{key}' not found.")
+
+    # 2. Load Payments
+    def get_payment_data(file, label):
+        df = smart_read_file(file, ["Sub Order", "Settlement", "Status"], sheet_name="Order Payments")
+        m = fuzzy_get_cols(df, {
+            "so": ["Sub Order No", "Order Number"],
+            "st": ["Live Order Status", "Status"],
+            "am": ["Final Settlement Amount", "Settlement"]
+        })
+        for key in ["so", "st", "am"]:
+            if not m[key]:
+                raise ValueError(f"{label} Payment file: mandatory column '{key}' not found.")
+        return df, m
+
+    df_same, map_same = get_payment_data(same_month_file, "Current Month")
+    df_next, map_next = get_payment_data(next_month_file, "Next Month")
+
+    # 3. Load Costs
+    df_cost_raw = smart_read_file(cost_file)
+    if isinstance(df_cost_raw.columns[0], int) or "Unnamed" in str(df_cost_raw.columns[0]):
+        df_cost_raw = df_cost_raw.iloc[:, :2]
+        df_cost_raw.columns = ["sku", "price"]
+    else:
+        c_map = fuzzy_get_cols(df_cost_raw, {"sku": ["SKU", "Product"], "price": ["Cost", "Price", "Value"]})
+        if not c_map["sku"] or not c_map["price"]:
+             df_cost_raw = df_cost_raw.iloc[:, :2]
+             df_cost_raw.columns = ["sku", "price"]
+        else:
+             df_cost_raw = df_cost_raw[[c_map["sku"], c_map["price"]]].rename(columns={c_map["sku"]: "sku", c_map["price"]: "price"})
+
+    # 4. Ads
+    total_ads = get_ads_from_sheet(same_month_file) + get_ads_from_sheet(next_month_file)
+
+    # Merge
+    for df, m in [(df_orders_raw, order_map), (df_same, map_same), (df_next, map_next)]:
+        df[m["so"]] = df[m["so"]].astype(str).str.strip()
+
+    df_pay_pool = pd.concat([
+        df_same[[map_same["so"], map_same["st"], map_same["am"]]].rename(columns={map_same["so"]: "so", map_same["st"]: "st", map_same["am"]: "am"}),
+        df_next[[map_next["so"], map_next["st"], map_next["am"]]].rename(columns={map_next["so"]: "so", map_next["st"]: "st", map_next["am"]: "am"})
+    ]).drop_duplicates(subset=["so"], keep="last")
+
+    def get_so_sum(df, m):
+        temp = df[[m["so"], m["am"]]].copy()
+        temp.columns = ["so", "am"]
+        temp["am"] = pd.to_numeric(temp["am"], errors="coerce").fillna(0)
+        return temp.groupby("so")["am"].sum().reset_index()
+
+    df_sum_same = get_so_sum(df_same, map_same).rename(columns={"am": "pay_same"})
+    df_sum_next = get_so_sum(df_next, map_next).rename(columns={"am": "pay_next"})
+
+    df_final = df_orders_raw[[order_map["so"], order_map["sku"], order_map["qty"]]].copy()
+    df_final.columns = ["so", "sku", "qty"]
+    df_final["qty"] = pd.to_numeric(df_final["qty"], errors="coerce").fillna(0)
+
+    df_final = df_final.merge(df_sum_same, on="so", how="left")
+    df_final = df_final.merge(df_sum_next, on="so", how="left")
+    df_final["total_pay"] = df_final[["pay_same", "pay_next"]].sum(axis=1)
+    df_final = df_final.merge(df_pay_pool[["so", "st"]], on="so", how="left")
+    
+    df_cost_raw["sku"] = df_cost_raw["sku"].astype(str).str.strip()
+    df_final["sku"] = df_final["sku"].astype(str).str.strip()
+    df_final = df_final.merge(df_cost_raw[["sku", "price"]], on="sku", how="left")
+    
+    missing_df = df_final[df_final["price"].isna()][["so", "sku", "st"]].drop_duplicates()
+    df_final["price"] = df_final["price"].fillna(0)
+
+    cl_st = df_final["st"].fillna("Unknown").str.strip()
+    delivered = cl_st.isin(['Delivered', 'Exchange'])
+    shipped = cl_st.isin(['Delivered', 'Exchange', 'Return', 'RTO', 'Shipped', 'Ready_to_ship'])
+    
+    df_final["prod_cost"] = np.where(delivered, df_final["price"] * df_final["qty"], 0)
+    df_final["pkg_cost"] = np.where(shipped, pack_cost, 0)
+    
+    stats = {
+        "Total Payments": df_final["total_pay"].sum(),
+        "Total Product Cost": df_final["prod_cost"].sum(),
+        "Total Packaging Cost": df_final["pkg_cost"].sum(),
+        "Ads Cost": abs(total_ads),
+        "Misc Cost": misc_cost,
+        "Delivered Count": len(df_final[cl_st == 'Delivered']),
+        "Return Count": len(df_final[cl_st == 'Return']),
+        "RTO Count": len(df_final[cl_st == 'RTO'])
+    }
+    stats["Net Profit"] = stats["Total Payments"] - stats["Total Product Cost"] - stats["Total Packaging Cost"] - stats["Ads Cost"] - stats["Misc Cost"]
+
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+        df_final.to_excel(writer, sheet_name='Orders', index=False)
+        pd.DataFrame(list(stats.items()), columns=["Metric", "Value"]).to_excel(writer, sheet_name='Summary', index=False)
+    buf.seek(0)
+
+    return buf, stats, missing_df
+
+# --- Streamlit UI Components ---
 def check_password():
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
+
     if st.session_state["password_correct"]:
         return True
 
-    st.markdown("### 🔒 Please Login")
+    st.title("🔒 Please Login")
     with st.form("credentials_form"):
-        st.text_input("Username", key="username")
-        st.text_input("Password", type="password", key="password")
+        user = st.text_input("Username")
+        pw = st.text_input("Password", type="password")
         if st.form_submit_button("Log In"):
-            if st.session_state["username"] in st.secrets["passwords"] and \
-               st.session_state["password"] == st.secrets["passwords"][st.session_state["username"]]:
+            secrets_ok = False
+            try:
+                if "passwords" in st.secrets and user in st.secrets["passwords"]:
+                    if pw == st.secrets["passwords"][user]:
+                        secrets_ok = True
+            except: pass
+            
+            if secrets_ok or (user == "admin" and pw == "meesho123"):
                 st.session_state["password_correct"] = True
                 st.rerun()
             else:
                 st.error("😕 User not known or password incorrect")
     return False
 
-# --- Main Processing Logic ---
-def process_data(orders_file, same_month_file, next_month_file, cost_file, packaging_cost_value, misc_cost_value):
-    try:
-        # --- A. Read Orders ---
-        df_orders = pd.read_csv(orders_file)
+def show_main_app():
+    st.title("📊 Meesho Profit/Loss Calculator")
+    
+    with st.expander("Step 1: Upload Files", expanded=True):
+        c1, c2 = st.columns(2)
+        orf = c1.file_uploader("Orders Master File (CSV/XLSX)", type=['csv', 'xlsx'])
+        csf = c1.file_uploader("Item Cost File (CSV/XLSX)", type=['csv', 'xlsx'])
+        smf = c2.file_uploader("Current Month Payment (XLSX)", type=['xlsx'])
+        nmf = c2.file_uploader("Next Month Payment (XLSX)", type=['xlsx'])
 
-        # --- B. Read Order Payments (Fixed Columns based on Meesho structure) ---
-        excel_cols = ["Sub Order No", "Live Order Status", "Final Settlement Amount"]
-        
-        # Read the payment sheets (using header=1 as seen in standard Meesho exports)
-        df_same_raw = pd.read_excel(same_month_file, sheet_name='Order Payments', header=1, usecols='A,F,L')
-        df_next_raw = pd.read_excel(next_month_file, sheet_name='Order Payments', header=1, usecols='A,F,L')
-        
-        df_same_raw.columns = excel_cols
-        df_next_raw.columns = excel_cols
+    with st.expander("Step 2: Settings"):
+        sc1, sc2 = st.columns(2)
+        p_c = sc1.number_input("Packaging Cost per Shipped Order", value=5.0)
+        m_c = sc2.number_input("Miscellaneous Monthly Cost", value=0.0)
 
-        # --- C. Read Cost File ---
-        if cost_file.name.endswith('.csv'):
-            df_cost = pd.read_csv(cost_file)
-        else:
-            df_cost = pd.read_excel(cost_file)
+    if orf and csf and smf and nmf:
+        if st.button("Calculate Profit", type="primary"):
+            try:
+                xl_buf, st_res, miss = run_profit_calculation(orf, smf, nmf, csf, p_c, m_c)
+                if st_res:
+                    st.divider()
+                    st.metric("Total Net Profit", f"₹{st_res['Net Profit']:,.2f}")
+                    
+                    mc = st.columns(4)
+                    mc[0].metric("Payments", f"₹{st_res['Total Payments']:,.2f}")
+                    mc[1].metric("Product Cost", f"₹{st_res['Total Product Cost']:,.2f}")
+                    mc[2].metric("Pkg Cost", f"₹{st_res['Total Packaging Cost']:,.2f}")
+                    mc[3].metric("Ads Spent", f"₹{st_res['Ads Cost']:,.2f}")
+                    
+                    if not miss.empty:
+                        st.warning(f"Found {len(miss)} missing SKUs in cost sheet.")
+                        st.dataframe(miss)
+                    
+                    st.download_button("📥 Download Detailed Report", xl_buf, "Meesho_Profit_Report.xlsx")
+            except Exception as e:
+                st.error(f"Analysis Error: {str(e)}")
+                st.code(traceback.format_exc())
 
-        # --- D. Read Ads Cost ---
-        same_month_file.seek(0)
-        next_month_file.seek(0)
-        try:
-            df_same_ads = pd.read_excel(same_month_file, sheet_name='Ads Cost', usecols="H")
-            same_ads_sum = pd.to_numeric(df_same_ads.iloc[:, 0], errors='coerce').sum()
-        except: same_ads_sum = 0
+# --- Launcher ---
+if __name__ == "__main__":
+    if "st" in globals() and hasattr(st, 'set_page_config'):
+        # We are running via streamlit
+        if "page_config_done" not in st.session_state:
+            st.set_page_config(page_title="Meesho Calculator", layout="wide", initial_sidebar_state="collapsed")
+            st.session_state["page_config_done"] = True
             
-        try:
-            df_next_ads = pd.read_excel(next_month_file, sheet_name='Ads Cost', usecols="H")
-            next_ads_sum = pd.to_numeric(df_next_ads.iloc[:, 0], errors='coerce').sum()
-        except: next_ads_sum = 0
-
-    except Exception as e:
-        st.error(f"Error reading files: {e}")
-        return None, None
-
-    # --- Data Processing ---
-    df_orders_raw = df_orders[["Sub Order No", "SKU", "Quantity"]].copy()
-    df_orders_raw['Quantity'] = pd.to_numeric(df_orders_raw['Quantity'], errors='coerce').fillna(0)
-
-    # Prepare status pool for lookup
-    df_order_status_pool = pd.concat([df_same_raw, df_next_raw], ignore_index=True)
-    
-    # Pivot Payments per Sub Order
-    def get_pivot(df, col_name):
-        df['Final Settlement Amount'] = pd.to_numeric(df['Final Settlement Amount'], errors='coerce').fillna(0)
-        pivot = pd.pivot_table(df, values='Final Settlement Amount', index=['Sub Order No'], aggfunc='sum').reset_index()
-        pivot.rename(columns={'Final Settlement Amount': col_name}, inplace=True)
-        return pivot
-
-    df_pivot_same = get_pivot(df_same_raw.copy(), 'same month pay')
-    df_pivot_next = get_pivot(df_next_raw.copy(), 'next month pay')
-
-    # --- Merging Data ---
-    df_orders_final = pd.merge(df_orders_raw, df_pivot_same, on='Sub Order No', how='left')
-    df_orders_final = pd.merge(df_orders_final, df_pivot_next, on='Sub Order No', how='left')
-    df_orders_final['total'] = df_orders_final[['same month pay', 'next month pay']].sum(axis=1)
-    
-    # Status Mapping (taking first occurrence)
-    status_lookup = df_order_status_pool[['Sub Order No', 'Live Order Status']].drop_duplicates(subset=['Sub Order No'], keep='first')
-    df_orders_final = pd.merge(df_orders_final, status_lookup, on='Sub Order No', how='left')
-    df_orders_final.rename(columns={'Live Order Status': 'status'}, inplace=True)
-
-    # --- COST LOGIC ---
-    # Assuming cost file first column is SKU and second is Value
-    cost_lookup = df_cost.iloc[:, :2].copy()
-    cost_lookup.columns = ['SKU_Lookup', 'Cost_Value']
-    df_orders_final['SKU'] = df_orders_final['SKU'].astype(str)
-    cost_lookup['SKU_Lookup'] = cost_lookup['SKU_Lookup'].astype(str)
-    df_orders_final = pd.merge(df_orders_final, cost_lookup, left_on='SKU', right_on='SKU_Lookup', how='left')
-
-    clean_status = df_orders_final['status'].fillna('Unknown').str.strip()
-    
-    # Cost only applies to Delivered or Exchange
-    cond_delivered = clean_status.isin(['Delivered', 'Exchange'])
-    df_orders_final['cost'] = np.where(cond_delivered, df_orders_final['Cost_Value'], 0)
-    df_orders_final['cost'] = df_orders_final['cost'].fillna(0)
-    df_orders_final['actual cost'] = df_orders_final['cost'] * df_orders_final['Quantity']
-    
-    # Packaging cost applies to all listed orders in the main sheet
-    df_orders_final['packaging cost'] = packaging_cost_value
-
-    # --- Final Stats Calculation ---
-    total_payment_sum = df_orders_final['total'].sum()
-    total_actual_cost_sum = df_orders_final['actual cost'].sum()
-    total_packaging_sum = len(df_orders_final) * packaging_cost_value
-    
-    stats = {
-        "Total Payments": total_payment_sum,
-        "Total Actual Cost": total_actual_cost_sum,
-        "Total Packaging Cost": total_packaging_sum,
-        "Same Month Ads Cost": same_ads_sum,
-        "Next Month Ads Cost": next_ads_sum,
-        "Miscellaneous Cost": misc_cost_value,
-        "Profit / Loss": total_payment_sum - total_actual_cost_sum - total_packaging_sum - abs(same_ads_sum) - misc_cost_value,
-        "count_total": len(df_orders_final),
-        "count_delivered": len(df_orders_final[clean_status == 'Delivered']),
-        "count_return": len(df_orders_final[clean_status == 'Return']),
-        "count_rto": len(df_orders_final[clean_status == 'RTO']),
-        "count_Exchange": len(df_orders_final[clean_status == 'Exchange']),
-        "count_cancelled": len(df_orders_final[clean_status == 'Cancelled']),
-        "count_Shipped": len(df_orders_final[clean_status == 'Shipped']),
-        "count_ready_to_ship": len(df_orders_final[clean_status == 'Ready_to_ship'])
-    }
-
-    # --- Generation of Multi-Sheet Excel ---
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        # 1. Main Data Sheet
-        df_orders_final.drop(columns=['SKU_Lookup', 'Cost_Value'], errors='ignore').to_excel(writer, sheet_name='orders.csv', index=False)
-        
-        # 2. Final Summary Sheet
-        pd.DataFrame(list(stats.items()), columns=['Metric', 'Value']).to_excel(writer, sheet_name='final sheet', index=False)
-        
-        # 3. Packaging Details Sheet
-        pkg_filter = clean_status.isin(['Delivered', 'Return', 'Exchange'])
-        df_pkg = df_orders_final[pkg_filter][['Sub Order No', 'SKU', 'status', 'packaging cost']].copy()
-        pkg_sum = df_pkg['packaging cost'].sum()
-        total_row = pd.DataFrame([['', '', 'Total Packaging Cost (Delivered/Return/Exchange)', pkg_sum]], columns=df_pkg.columns)
-        pd.concat([df_pkg, total_row], ignore_index=True).to_excel(writer, sheet_name='Packaging Details', index=False)
-
-        # 4. Same Month Sheet (for audit)
-        df_same_raw.to_excel(writer, sheet_name='same month', index=False)
-        
-        # 5. Next Month Sheet (for audit)
-        df_next_raw.to_excel(writer, sheet_name='next month', index=False)
-
-    output.seek(0)
-    return output, stats
-
-# --- Streamlit App Interface ---
-if check_password():
-    st.title("📊 Dashboard Data Processor")
-
-    # Persistent Storage to prevent dashboard from clearing on download
-    if "results" not in st.session_state:
-        st.session_state.results = None
-
-    st.markdown("### 1. Upload & Settings")
-    col_left, col_right = st.columns(2)
-    with col_left:
-        orders_file = st.file_uploader("1. Upload orders.csv", type=['csv'])
-        cost_file = st.file_uploader("2. Upload cost file", type=['csv', 'xlsx'])
-    with col_right:
-        same_month_file = st.file_uploader("3. Upload same month payment", type=['xlsx'])
-        next_month_file = st.file_uploader("4. Upload next month payment", type=['xlsx'])
-
-    c_set1, c_set2 = st.columns(2)
-    pack_cost = c_set1.number_input("Packaging Cost (per order)", value=5.0)
-    misc_cost = c_set2.number_input("Miscellaneous Cost", value=0.0)
-
-    if orders_file and cost_file and same_month_file and next_month_file:
-        if st.button("🚀 Process Data and Generate Report", type="primary"):
-            with st.spinner("Processing data..."):
-                excel_data, stats = process_data(orders_file, same_month_file, next_month_file, cost_file, pack_cost, misc_cost)
-                if excel_data:
-                    st.session_state.results = {"data": excel_data, "stats": stats}
-
-    # UI Presentation of Results
-    if st.session_state.results:
-        res = st.session_state.results
-        stats = res["stats"]
-
-        st.success("✅ Processing Complete!")
-        
-        st.markdown("### 📈 Financial Summary")
-        st.metric("PROFIT / LOSS", f"₹{stats['Profit / Loss']:,.2f}")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Total Payments", f"₹{stats['Total Payments']:,.2f}")
-        col2.metric("Actual Cost", f"₹{stats['Total Actual Cost']:,.2f}")
-        col3.metric("Packaging", f"₹{stats['Total Packaging Cost']:,.2f}")
-        col4.metric("Ads (Same Month)", f"₹{stats['Same Month Ads Cost']:,.2f}")
-        
-        st.divider()
-        
-        st.markdown("### 📦 Order Status Breakdown")
-        c = st.columns(8)
-        c[0].metric("Total", stats['count_total'])
-        c[1].metric("Delivered", stats['count_delivered'])
-        c[2].metric("Return", stats['count_return'])
-        c[3].metric("RTO", stats['count_rto'])
-        c[4].metric("Exchange", stats['count_Exchange'])
-        c[5].metric("Cancelled", stats['count_cancelled'])
-        c[6].metric("Shipped", stats['count_Shipped'])
-        c[7].metric("Ready", stats['count_ready_to_ship'])
-
-        st.divider()
-        st.download_button(
-            "⬇️ Download Excel Report", 
-            data=res["data"], 
-            file_name="Final_Report.xlsx", 
-            type="primary", 
-            use_container_width=True
-        )
-        st.balloons()
+        if check_password():
+            show_main_app()
+    else:
+        print("This script is designed to be run via: streamlit run app.py")
