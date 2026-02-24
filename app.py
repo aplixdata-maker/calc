@@ -42,7 +42,7 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
         # --- A. Read Orders ---
         df_orders = pd.read_csv(orders_file)
 
-        # --- B. Read Order Payments (Dynamic Column Mapping) ---
+        # --- B. Read Order Payments ---
         def read_payment_sheet(file):
             df_raw = pd.read_excel(file, sheet_name='Order Payments', header=1)
             cols_to_extract = {
@@ -160,6 +160,10 @@ def process_data(orders_file, same_month_file, next_month_file, cost_file, packa
 if check_password():
     st.title("📊 Meesho Profit/Loss Dashboard")
     
+    # Initialize session state for calculated data
+    if "calculated_results" not in st.session_state:
+        st.session_state.calculated_results = None
+
     with st.expander("Step 1: Upload Files", expanded=True):
         c1, c2 = st.columns(2)
         orders_file = c1.file_uploader("Orders File (CSV)", type=['csv'])
@@ -174,37 +178,48 @@ if check_password():
 
     if orders_file and cost_file and same_month_file and next_month_file:
         if st.button("Calculate", type="primary"):
-            # SHOW PROCESSING ICON
             with st.spinner('Calculating financial data...'):
                 excel_data, stats, missing = process_data(orders_file, same_month_file, next_month_file, cost_file, pack_cost, misc_cost)
-            
-            if stats:
-                # --- Financial Summary ---
-                st.subheader("📈 Financial Summary")
-                st.metric("PROFIT / LOSS", f"₹{stats['Profit / Loss']:,.2f}")
-                
-                f_cols = st.columns(4)
-                f_cols[0].metric("Total Payments", f"₹{stats['Total Payments']:,.2f}")
-                f_cols[1].metric("Actual Cost", f"₹{stats['Total Actual Cost']:,.2f}")
-                f_cols[2].metric("Packaging", f"₹{stats['Total Packaging Cost']:,.2f}")
-                f_cols[3].metric("Ads (Same Month)", f"₹{stats['Same Month Ads Cost']:,.2f}")
-                
-                st.divider()
+                # Store in session state
+                st.session_state.calculated_results = {
+                    "excel_data": excel_data,
+                    "stats": stats,
+                    "missing": missing
+                }
+    
+    # Display results if they exist in session state
+    if st.session_state.calculated_results:
+        res = st.session_state.calculated_results
+        stats = res["stats"]
+        excel_data = res["excel_data"]
+        missing = res["missing"]
 
-                # --- Order Status Breakdown ---
-                st.subheader("📦 Order Status Breakdown")
-                s_cols = st.columns(8)
-                s_cols[0].metric("Total Orders", stats['count_total'])
-                s_cols[1].metric("Delivered", stats['count_delivered'])
-                s_cols[2].metric("Return", stats['count_return'])
-                s_cols[3].metric("RTO", stats['count_rto'])
-                s_cols[4].metric("Exchange", stats['count_Exchange'])
-                s_cols[5].metric("Cancelled", stats['count_cancelled'])
-                s_cols[6].metric("Shipped", stats['count_Shipped'])
-                s_cols[7].metric("Ready_to_ship", stats['count_ready_to_ship'])
-                
-                if not missing.empty:
-                    st.warning(f"Found {len(missing)} missing SKUs in cost sheet.")
-                    st.dataframe(missing)
-                
-                st.download_button("Download Report", excel_data, "Report.xlsx")
+        # --- Financial Summary ---
+        st.subheader("📈 Financial Summary")
+        st.metric("PROFIT / LOSS", f"₹{stats['Profit / Loss']:,.2f}")
+        
+        f_cols = st.columns(4)
+        f_cols[0].metric("Total Payments", f"₹{stats['Total Payments']:,.2f}")
+        f_cols[1].metric("Actual Cost", f"₹{stats['Total Actual Cost']:,.2f}")
+        f_cols[2].metric("Packaging", f"₹{stats['Total Packaging Cost']:,.2f}")
+        f_cols[3].metric("Ads (Same Month)", f"₹{stats['Same Month Ads Cost']:,.2f}")
+        
+        st.divider()
+
+        # --- Order Status Breakdown ---
+        st.subheader("📦 Order Status Breakdown")
+        s_cols = st.columns(8)
+        s_cols[0].metric("Total Orders", stats['count_total'])
+        s_cols[1].metric("Delivered", stats['count_delivered'])
+        s_cols[2].metric("Return", stats['count_return'])
+        s_cols[3].metric("RTO", stats['count_rto'])
+        s_cols[4].metric("Exchange", stats['count_Exchange'])
+        s_cols[5].metric("Cancelled", stats['count_cancelled'])
+        s_cols[6].metric("Shipped", stats['count_Shipped'])
+        s_cols[7].metric("Ready_to_ship", stats['count_ready_to_ship'])
+        
+        if not missing.empty:
+            st.warning(f"Found {len(missing)} missing SKUs in cost sheet.")
+            st.dataframe(missing)
+        
+        st.download_button("Download Report", excel_data, "Report.xlsx")
